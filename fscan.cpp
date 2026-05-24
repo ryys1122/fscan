@@ -138,6 +138,74 @@ static bool is_excluded(const std::string& name,
     return false;
 }
 
+static bool is_text_file(const char* path);
+
+static inline bool is_dots(const char* name) {
+    return name[0] == '.' &&
+        (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'));
+}
+
+static inline bool do_stat(const char* path, struct stat& st, bool follow) {
+    return (follow ? ::stat(path, &st) : ::lstat(path, &st)) == 0;
+}
+
+static inline bool passes_time_filter(time_t mtime, const Config& cfg) {
+    if (cfg.since && mtime < cfg.since) return false;
+    if (cfg.until && mtime > cfg.until) return false;
+    return true;
+}
+
+static inline bool passes_file_filter(const std::string& path,
+                                       std::uint64_t size, const Config& cfg) {
+    if (cfg.min_size > 0 && size < cfg.min_size) return false;
+    if (cfg.max_size > 0 && size > cfg.max_size) return false;
+    if (cfg.text_only && !is_text_file(path.c_str())) return false;
+    return true;
+}
+
+static bool should_skip_entry(const char* d_name, const Config& cfg) {
+    if (is_dots(d_name)) return true;
+    if (!cfg.include_hidden && d_name[0] == '.') return true;
+    std::string name(d_name);
+    if (is_excluded(name, cfg.exclude_patterns)) return true;
+    return false;
+}
+
+static std::string basename(const std::string& path) {
+    auto sl = path.find_last_of('/');
+    return (sl != std::string::npos) ? path.substr(sl + 1) : path;
+}
+
+static int compute_thread_count(int config_count, size_t num_tasks) {
+    int n = config_count > 0 ? config_count
+                             : (int)std::thread::hardware_concurrency();
+    if (n <= 0) n = 4;
+    return std::min(n, (int)num_tasks);
+}
+
+static void print_extensions(const FileInfo& info) {
+    printf("  extensions:\n");
+    std::vector<std::pair<std::string, std::uint64_t>> sorted(
+        info.ext_cnt.begin(), info.ext_cnt.end());
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    for (auto& kv : sorted) {
+        std::uint64_t sz = 0;
+        auto it = info.ext_sz.find(kv.first);
+        if (it != info.ext_sz.end()) sz = it->second;
+        printf("    %-14s %s  (%s)\n",
+               kv.first.c_str(), fmt_num(kv.second).c_str(),
+               fmt_size_str(sz).c_str());
+    }
+}
+
+static void print_find_line(const std::string& path, std::uint64_t size,
+                             const Config& cfg) {
+    printf("%*s  %s\n", cfg.find_unit_w,
+           fmt_find_size(size, cfg.find_unit).c_str(), path.c_str());
+    fflush(stdout);
+}
+
 // ---------------------------------------------------------------------------
 //  Time parsing
 // ---------------------------------------------------------------------------
@@ -198,34 +266,20 @@ static void walk(const char* dir, int cur_depth, FileInfo& info,
 
     struct dirent* entry;
     while ((entry = readdir(dp))) {
-        if (entry->d_name[0] == '.' &&
-            (entry->d_name[1] == '\0' ||
-             (entry->d_name[1] == '.' && entry->d_name[2] == '\0')))
-            continue;
+        if (should_skip_entry(entry->d_name, cfg)) continue;
 
         std::string name(entry->d_name);
-        if (!cfg.include_hidden && is_hidden(name)) continue;
-        if (is_excluded(name, cfg.exclude_patterns)) continue;
-
         std::string full = std::string(dir) + "/" + name;
 
         struct stat st;
-        if (cfg.follow_symlinks) {
-            if (::stat(full.c_str(), &st) != 0) continue;
-        } else {
-            if (::lstat(full.c_str(), &st) != 0) continue;
-        }
-
-        if (cfg.since && st.st_mtime < cfg.since) continue;
-        if (cfg.until && st.st_mtime > cfg.until) continue;
+        if (!do_stat(full.c_str(), st, cfg.follow_symlinks)) continue;
+        if (!passes_time_filter(st.st_mtime, cfg)) continue;
 
         if (S_ISDIR(st.st_mode)) {
             if (cfg.max_depth < 0 || cur_depth + 1 <= cfg.max_depth)
                 walk(full.c_str(), cur_depth + 1, info, cfg);
         } else if (S_ISREG(st.st_mode)) {
-            if (cfg.text_only && !is_text_file(full.c_str())) continue;
-            if (cfg.min_size > 0 && (std::uint64_t)st.st_size < cfg.min_size) continue;
-            if (cfg.max_size > 0 && (std::uint64_t)st.st_size > cfg.max_size) continue;
+            if (!passes_file_filter(full, (std::uint64_t)st.st_size, cfg)) continue;
             info.count++;
             info.total_size += (std::uint64_t)st.st_size;
             std::string ext = file_ext(name);
@@ -248,38 +302,20 @@ static void find_walk(const char* dir, const Config& cfg) {
 
     struct dirent* entry;
     while ((entry = readdir(dp))) {
-        if (entry->d_name[0] == '.' &&
-            (entry->d_name[1] == '\0' ||
-             (entry->d_name[1] == '.' && entry->d_name[2] == '\0')))
-            continue;
+        if (should_skip_entry(entry->d_name, cfg)) continue;
 
         std::string name(entry->d_name);
-        if (!cfg.include_hidden && is_hidden(name)) continue;
-        if (is_excluded(name, cfg.exclude_patterns)) continue;
-
         std::string full = std::string(dir) + "/" + name;
         struct stat st;
-        if (cfg.follow_symlinks) {
-            if (::stat(full.c_str(), &st) != 0) continue;
-        } else {
-            if (::lstat(full.c_str(), &st) != 0) continue;
-        }
-
-        if (cfg.since && st.st_mtime < cfg.since) continue;
-        if (cfg.until && st.st_mtime > cfg.until) continue;
+        if (!do_stat(full.c_str(), st, cfg.follow_symlinks)) continue;
+        if (!passes_time_filter(st.st_mtime, cfg)) continue;
 
         if (S_ISDIR(st.st_mode)) {
-            if (cfg.max_depth < 0 || true) // find always recurses into dirs
-                find_walk(full.c_str(), cfg);
+            find_walk(full.c_str(), cfg);
         } else if (S_ISREG(st.st_mode)) {
-            if (cfg.text_only && !is_text_file(full.c_str())) continue;
-            if (cfg.min_size > 0 && (std::uint64_t)st.st_size < cfg.min_size) continue;
-            if (cfg.max_size > 0 && (std::uint64_t)st.st_size > cfg.max_size) continue;
+            if (!passes_file_filter(full, (std::uint64_t)st.st_size, cfg)) continue;
             std::lock_guard<std::mutex> lk(find_mtx);
-            printf("%*s  %s\n", cfg.find_unit_w,
-                   fmt_find_size((std::uint64_t)st.st_size, cfg.find_unit).c_str(),
-                   full.c_str());
-            fflush(stdout);
+            print_find_line(full, (std::uint64_t)st.st_size, cfg);
         }
     }
     closedir(dp);
@@ -288,24 +324,15 @@ static void find_walk(const char* dir, const Config& cfg) {
 // Parallel find: split top-level subdirs across threads
 static void find_path(const std::string& path, const Config& cfg) {
     struct stat st;
-    if (cfg.follow_symlinks) {
-        if (::stat(path.c_str(), &st) != 0) return;
-    } else {
-        if (::lstat(path.c_str(), &st) != 0) return;
-    }
+    if (!do_stat(path.c_str(), st, cfg.follow_symlinks)) return;
 
     if (S_ISREG(st.st_mode)) {
-        if (cfg.text_only && !is_text_file(path.c_str())) return;
-        if (cfg.min_size > 0 && (std::uint64_t)st.st_size < cfg.min_size) return;
-        if (cfg.max_size > 0 && (std::uint64_t)st.st_size > cfg.max_size) return;
-        printf("%*s  %s\n", cfg.find_unit_w,
-               fmt_find_size((std::uint64_t)st.st_size, cfg.find_unit).c_str(),
-               path.c_str());
+        if (!passes_file_filter(path, (std::uint64_t)st.st_size, cfg)) return;
+        print_find_line(path, (std::uint64_t)st.st_size, cfg);
         return;
     }
     if (!S_ISDIR(st.st_mode)) return;
 
-    // Collect top-level entries
     DIR* dp = opendir(path.c_str());
     if (!dp) return;
 
@@ -313,44 +340,26 @@ static void find_path(const std::string& path, const Config& cfg) {
     std::vector<std::string> subdirs;
 
     while ((ent = readdir(dp))) {
-        if (ent->d_name[0] == '.' &&
-            (ent->d_name[1] == '\0' ||
-             (ent->d_name[1] == '.' && ent->d_name[2] == '\0')))
-            continue;
-        std::string name(ent->d_name);
-        if (!cfg.include_hidden && is_hidden(name)) continue;
-        if (is_excluded(name, cfg.exclude_patterns)) continue;
+        if (should_skip_entry(ent->d_name, cfg)) continue;
 
+        std::string name(ent->d_name);
         std::string full = path + "/" + name;
         struct stat s;
-        if (cfg.follow_symlinks) {
-            if (::stat(full.c_str(), &s) != 0) continue;
-        } else {
-            if (::lstat(full.c_str(), &s) != 0) continue;
-        }
-        if (cfg.since && s.st_mtime < cfg.since) continue;
-        if (cfg.until && s.st_mtime > cfg.until) continue;
+        if (!do_stat(full.c_str(), s, cfg.follow_symlinks)) continue;
+        if (!passes_time_filter(s.st_mtime, cfg)) continue;
 
         if (S_ISDIR(s.st_mode)) {
             subdirs.push_back(full);
         } else if (S_ISREG(s.st_mode)) {
-            if (cfg.text_only && !is_text_file(full.c_str())) continue;
-            if (cfg.min_size > 0 && (std::uint64_t)s.st_size < cfg.min_size) continue;
-            if (cfg.max_size > 0 && (std::uint64_t)s.st_size > cfg.max_size) continue;
-            printf("%*s  %s\n", cfg.find_unit_w,
-                   fmt_find_size((std::uint64_t)s.st_size, cfg.find_unit).c_str(),
-                   full.c_str());
-            fflush(stdout);
+            if (!passes_file_filter(full, (std::uint64_t)s.st_size, cfg)) continue;
+            print_find_line(full, (std::uint64_t)s.st_size, cfg);
         }
     }
     closedir(dp);
 
     if (subdirs.empty()) return;
 
-    int nthreads = cfg.thread_count > 0
-        ? cfg.thread_count : (int)std::thread::hardware_concurrency();
-    if (nthreads <= 0) nthreads = 4;
-    nthreads = std::min(nthreads, (int)subdirs.size());
+    int nthreads = compute_thread_count(cfg.thread_count, subdirs.size());
 
     std::vector<std::future<void>> futs;
     futs.reserve(nthreads);
@@ -374,22 +383,14 @@ static FileInfo count_path(const std::string& path, const Config& cfg) {
     FileInfo info;
 
     struct stat st;
-    if (cfg.follow_symlinks) {
-        if (::stat(path.c_str(), &st) != 0) return info;
-    } else {
-        if (::lstat(path.c_str(), &st) != 0) return info;
-    }
+    if (!do_stat(path.c_str(), st, cfg.follow_symlinks)) return info;
 
-    // Single regular file
     if (S_ISREG(st.st_mode)) {
-        if (cfg.text_only && !is_text_file(path.c_str())) return info;
-        if (cfg.min_size > 0 && (std::uint64_t)st.st_size < cfg.min_size) return info;
-        if (cfg.max_size > 0 && (std::uint64_t)st.st_size > cfg.max_size) return info;
+        if (!passes_file_filter(path, (std::uint64_t)st.st_size, cfg)) return info;
         info.count = 1;
         info.total_size = (std::uint64_t)st.st_size;
-        std::string name = path;
-        auto sl = path.find_last_of('/');
-        if (sl != std::string::npos) name = path.substr(sl + 1);
+        std::string name = basename(path);
+        if (name.empty()) name = path;
         std::string ext = file_ext(name);
         info.ext_cnt[ext] = 1;
         info.ext_sz[ext] = info.total_size;
@@ -397,7 +398,6 @@ static FileInfo count_path(const std::string& path, const Config& cfg) {
     }
     if (!S_ISDIR(st.st_mode)) return info;
 
-    // Collect top-level entries
     DIR* dp = opendir(path.c_str());
     if (!dp) return info;
 
@@ -405,31 +405,18 @@ static FileInfo count_path(const std::string& path, const Config& cfg) {
     std::vector<std::string> subdirs;
 
     while ((ent = readdir(dp))) {
-        if (ent->d_name[0] == '.' &&
-            (ent->d_name[1] == '\0' ||
-             (ent->d_name[1] == '.' && ent->d_name[2] == '\0')))
-            continue;
+        if (should_skip_entry(ent->d_name, cfg)) continue;
 
         std::string name(ent->d_name);
-        if (!cfg.include_hidden && is_hidden(name)) continue;
-        if (is_excluded(name, cfg.exclude_patterns)) continue;
-
         std::string full = path + "/" + name;
         struct stat s;
-        if (cfg.follow_symlinks) {
-            if (::stat(full.c_str(), &s) != 0) continue;
-        } else {
-            if (::lstat(full.c_str(), &s) != 0) continue;
-        }
-        if (cfg.since && s.st_mtime < cfg.since) continue;
-        if (cfg.until && s.st_mtime > cfg.until) continue;
+        if (!do_stat(full.c_str(), s, cfg.follow_symlinks)) continue;
+        if (!passes_time_filter(s.st_mtime, cfg)) continue;
 
         if (S_ISDIR(s.st_mode)) {
             subdirs.push_back(full);
         } else if (S_ISREG(s.st_mode)) {
-            if (cfg.text_only && !is_text_file(full.c_str())) continue;
-            if (cfg.min_size > 0 && (std::uint64_t)s.st_size < cfg.min_size) continue;
-            if (cfg.max_size > 0 && (std::uint64_t)s.st_size > cfg.max_size) continue;
+            if (!passes_file_filter(full, (std::uint64_t)s.st_size, cfg)) continue;
             info.count++;
             info.total_size += (std::uint64_t)s.st_size;
             std::string ext = file_ext(name);
@@ -441,11 +428,7 @@ static FileInfo count_path(const std::string& path, const Config& cfg) {
 
     if (subdirs.empty()) return info;
 
-    // Parallel dispatch
-    int nthreads = cfg.thread_count > 0
-        ? cfg.thread_count : (int)std::thread::hardware_concurrency();
-    if (nthreads <= 0) nthreads = 4;
-    nthreads = std::min(nthreads, (int)subdirs.size());
+    int nthreads = compute_thread_count(cfg.thread_count, subdirs.size());
 
     std::vector<FileInfo> tinfo(nthreads);
     std::vector<std::future<void>> futs;
@@ -517,21 +500,8 @@ static void output_default(const std::string& name, const FileInfo& info,
     }
     printf("%s\n", name.c_str());
 
-    if (cfg.show_extensions && !info.ext_cnt.empty()) {
-        printf("  extensions:\n");
-        std::vector<std::pair<std::string, std::uint64_t>> sorted(
-            info.ext_cnt.begin(), info.ext_cnt.end());
-        std::sort(sorted.begin(), sorted.end(),
-                  [](const auto& a, const auto& b){ return a.second > b.second; });
-        for (auto& p : sorted) {
-            std::uint64_t sz = 0;
-            auto it = info.ext_sz.find(p.first);
-            if (it != info.ext_sz.end()) sz = it->second;
-            printf("    %-14s %s  (%s)\n",
-                   p.first.c_str(), fmt_num(p.second).c_str(),
-                   fmt_size_str(sz).c_str());
-        }
-    }
+    if (cfg.show_extensions && !info.ext_cnt.empty())
+        print_extensions(info);
 }
 
 // Truncate long names with ellipsis in the middle
@@ -573,10 +543,9 @@ static void init_aligned_params(const std::vector<std::string>& paths,
                                 int& nw, int& cnt_w, int& sz_w, int& dep_w,
                                 int& max_name_w) {
     // Pre-compute name width from paths
-    nw = 5; // min for "total"
+    nw = 5;
     for (auto& p : paths) {
-        auto sl = p.find_last_of('/');
-        std::string base = (sl != std::string::npos) ? p.substr(sl + 1) : p;
+        std::string base = basename(p);
         if (base.empty()) base = p;
         nw = std::max(nw, (int)base.size());
     }
@@ -617,28 +586,20 @@ static TreeNode build_tree(const std::string& path, int cur,
     if (!dp) return node;
 
     struct dirent* ent;
-    std::vector<std::string> dirnames, filenames;
+    std::vector<std::string> dirnames;
 
     while ((ent = readdir(dp))) {
-        if (ent->d_name[0] == '.' &&
-            (ent->d_name[1] == '\0' ||
-             (ent->d_name[1] == '.' && ent->d_name[2] == '\0')))
-            continue;
-        std::string name(ent->d_name);
-        if (!cfg.include_hidden && is_hidden(name)) continue;
-        if (is_excluded(name, cfg.exclude_patterns)) continue;
+        if (should_skip_entry(ent->d_name, cfg)) continue;
 
+        std::string name(ent->d_name);
         std::string full = path + "/" + name;
         struct stat s;
-        if (cfg.follow_symlinks ? ::stat(full.c_str(), &s)
-                                : ::lstat(full.c_str(), &s))
-            continue;
+        if (!do_stat(full.c_str(), s, cfg.follow_symlinks)) continue;
 
         if (S_ISDIR(s.st_mode)) {
             dirnames.push_back(name);
         } else if (S_ISREG(s.st_mode)) {
-            if (cfg.text_only && !is_text_file(full.c_str())) continue;
-            filenames.push_back(name);
+            if (!passes_file_filter(full, (std::uint64_t)s.st_size, cfg)) continue;
             node.files++;
         }
     }
@@ -651,7 +612,6 @@ static TreeNode build_tree(const std::string& path, int cur,
             node.children.push_back(
                 build_tree(path + "/" + dn, cur + 1, cfg));
         } else {
-            // Quick recursive count without building full tree
             FileInfo fi;
             walk((path + "/" + dn).c_str(), 0, fi, cfg);
             TreeNode stub;
@@ -661,7 +621,6 @@ static TreeNode build_tree(const std::string& path, int cur,
         }
     }
 
-    // Accumulate recursive totals from children
     for (auto& ch : node.children) {
         node.files += ch.files;
         node.dirs += ch.dirs;
@@ -671,11 +630,9 @@ static TreeNode build_tree(const std::string& path, int cur,
 
 static void print_tree_node(const TreeNode& node, const Config& cfg,
                             const std::string& prefix, bool last) {
-    // Print this node
-    std::string conn = last ? "└── " : "├── ";
-    std::string label = node.name;
-    auto p = node.name.find_last_of('/');
-    if (p != std::string::npos) label = node.name.substr(p + 1);
+    std::string conn = last ? "\xe2\x94\x94\xe2\x94\x80\xe2\x94\x80 " : "\xe2\x94\x9c\xe2\x94\x80\xe2\x94\x80 ";
+    std::string label = basename(node.name);
+    if (label.empty()) label = node.name;
 
     printf("%s%s", prefix.c_str(), conn.c_str());
     printf("%s", label.c_str());
@@ -688,20 +645,17 @@ static void print_tree_node(const TreeNode& node, const Config& cfg,
     }
     printf("\n");
 
-    std::string new_prefix = prefix + (last ? "    " : "│   ");
+    std::string new_prefix = prefix + (last ? "    " : "\xe2\x94\x82   ");
     for (size_t i = 0; i < node.children.size(); ++i) {
         bool is_last = (i + 1 == node.children.size());
         print_tree_node(node.children[i], cfg, new_prefix, is_last);
     }
 }
 
-static void output_tree(const std::string& path, int cur,
-                        const Config& cfg, const std::string& prefix, bool last) {
+static void output_tree(const std::string& path, int cur, const Config& cfg) {
     TreeNode tree = build_tree(path, cur, cfg);
-    // print the root
-    std::string label = path;
-    auto p = path.find_last_of('/');
-    if (p != std::string::npos) label = path.substr(p + 1);
+    std::string label = basename(path);
+    if (label.empty()) label = path;
     printf("%s [%df, %dd]\n", label.c_str(), tree.files, tree.dirs);
 
     for (size_t i = 0; i < tree.children.size(); ++i)
@@ -806,9 +760,10 @@ int main(int argc, char* argv[]) {
             usage(); return 1;
         }
         else {
-            for (auto& p : resolve_arg(argv[i]))
+            auto resolved = resolve_arg(argv[i]);
+            for (auto& p : resolved)
                 cfg.paths.push_back(p);
-            if (cfg.paths.empty() && resolve_arg(argv[i]).empty()) return 1;
+            if (cfg.paths.empty() && resolved.empty()) return 1;
         }
     }
 
@@ -859,8 +814,7 @@ int main(int argc, char* argv[]) {
         grand_size += info.total_size;
         if (info.max_depth > total_max_depth) total_max_depth = info.max_depth;
 
-        auto sl = p.find_last_of('/');
-        std::string base = (sl != std::string::npos) ? p.substr(sl + 1) : p;
+        std::string base = basename(p);
         if (base.empty()) base = p;
 
         if (cfg.find_mode) {
@@ -888,26 +842,13 @@ int main(int argc, char* argv[]) {
         } else if (cfg.tree_output) {
             if (multi)
                 printf("%s\n", p.c_str());
-            output_tree(p, 0, cfg, "", true);
+            output_tree(p, 0, cfg);
             fflush(stdout);
         } else if (cfg.align_output) {
             print_aligned_line(base, info.count, info.total_size, info.max_depth,
                                cfg, anw, acnt_w, asz_w, adep_w, aname_w);
-            if (cfg.show_extensions && !info.ext_cnt.empty()) {
-                printf("  extensions:\n");
-                std::vector<std::pair<std::string, std::uint64_t>> sorted(
-                    info.ext_cnt.begin(), info.ext_cnt.end());
-                std::sort(sorted.begin(), sorted.end(),
-                          [](const auto& a, const auto& b){ return a.second > b.second; });
-                for (auto& pr : sorted) {
-                    std::uint64_t sz = 0;
-                    auto it = info.ext_sz.find(pr.first);
-                    if (it != info.ext_sz.end()) sz = it->second;
-                    printf("    %-14s %s  (%s)\n",
-                           pr.first.c_str(), fmt_num(pr.second).c_str(),
-                           fmt_size_str(sz).c_str());
-                }
-            }
+            if (cfg.show_extensions && !info.ext_cnt.empty())
+                print_extensions(info);
             fflush(stdout);
         } else {
             output_default(base, info, cfg);
@@ -915,13 +856,11 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    if (multi && !cfg.find_mode) {
+    if (multi && !cfg.find_mode && !cfg.tree_output) {
         if (cfg.csv_output) {
             printf("\"total\",%lu", (unsigned long)grand);
             if (cfg.show_size) printf(",%lu", (unsigned long)grand_size);
             printf("\n");
-        } else if (cfg.tree_output) {
-            // no total for tree
         } else if (cfg.align_output) {
             print_aligned_line("total", 0, 0, 0,
                                cfg, anw, acnt_w, asz_w, adep_w, aname_w,
