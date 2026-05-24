@@ -1,0 +1,11 @@
+# Build output
+fscan
+*.o
+*.obj
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
