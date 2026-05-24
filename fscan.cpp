@@ -14,9 +14,17 @@
 #include <unordered_map>
 #include <vector>
 
-// ---------------------------------------------------------------------------
-//  Config
-// ---------------------------------------------------------------------------
+enum class SizeUnit { Auto = 0, B, KB, MB, GB, TB };
+
+static constexpr std::uint64_t KB = 1024ULL;
+static constexpr std::uint64_t MB = KB * 1024;
+static constexpr std::uint64_t GB = MB * 1024;
+static constexpr std::uint64_t TB = GB * 1024;
+
+static constexpr int TEXT_DETECT_BUF = 8192;
+static constexpr int DEFAULT_THREADS = 4;
+static constexpr int MIN_ELLIPSIS_WIDTH = 5;
+
 struct Config {
     std::vector<std::string> paths;
 
@@ -30,11 +38,10 @@ struct Config {
     bool text_only        = false;
     bool align_output     = false;
     bool dirs_only        = false;
-    bool find_mode        = false;  // list individual files with sizes
+    bool find_mode        = false;
 
-    // find mode unit: 0=auto, 1=B, 2=KB, 3=MB, 4=GB, 5=TB
-    int find_unit           = 0;
-    int find_unit_w          = 0;   // max width for the unit string
+    SizeUnit find_unit    = SizeUnit::Auto;
+    int find_unit_w       = 0;
 
     int max_depth        = -1;
     int thread_count     = 0;
@@ -64,18 +71,16 @@ static std::string fmt_size_str(std::uint64_t bytes) {
     return buf;
 }
 
-// Format size for find mode: value right-aligned in given width, unit suffix
-static std::string fmt_find_size(std::uint64_t bytes, int unit) {
-    if (unit == 0) {
-        // auto: pick best unit, show suffix, integer
-        return fmt_size_str(bytes);
-    }
+static std::string fmt_find_size(std::uint64_t bytes, SizeUnit unit) {
+    if (unit == SizeUnit::Auto) return fmt_size_str(bytes);
     static const char* units[] = {"","B","KB","MB","GB","TB"};
     double d = (double)bytes;
-    for (int i = 1; i < unit; ++i) d /= 1024.0;
+    for (int i = 1; i < (int)unit; ++i) d /= 1024.0;
     char buf[32];
-    if (unit == 1) snprintf(buf, sizeof buf, "%lu %s", (unsigned long)bytes, units[unit]);
-    else           snprintf(buf, sizeof buf, "%.0f %s", d, units[unit]);
+    if (unit == SizeUnit::B)
+        snprintf(buf, sizeof buf, "%lu %s", (unsigned long)bytes, units[(int)unit]);
+    else
+        snprintf(buf, sizeof buf, "%.0f %s", d, units[(int)unit]);
     return buf;
 }
 
@@ -179,7 +184,7 @@ static std::string basename(const std::string& path) {
 static int compute_thread_count(int config_count, size_t num_tasks) {
     int n = config_count > 0 ? config_count
                              : (int)std::thread::hardware_concurrency();
-    if (n <= 0) n = 4;
+    if (n <= 0) n = DEFAULT_THREADS;
     return std::min(n, (int)num_tasks);
 }
 
@@ -227,10 +232,10 @@ static std::uint64_t parse_size(const char* s) {
         return 0;
     }
     switch (*end) {
-        case 'T': case 't': val *= 1024ULL * 1024 * 1024 * 1024; break;
-        case 'G': case 'g': val *= 1024ULL * 1024 * 1024; break;
-        case 'M': case 'm': val *= 1024ULL * 1024; break;
-        case 'K': case 'k': val *= 1024ULL; break;
+        case 'T': case 't': val *= TB; break;
+        case 'G': case 'g': val *= GB; break;
+        case 'M': case 'm': val *= MB; break;
+        case 'K': case 'k': val *= KB; break;
         case 'B': case 'b': break;
         case '\0': break;
         default:
@@ -244,15 +249,12 @@ static std::uint64_t parse_size(const char* s) {
 static bool is_text_file(const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) return false;
-    unsigned char buf[8192];
+    unsigned char buf[TEXT_DETECT_BUF];
     size_t n = fread(buf, 1, sizeof buf, f);
     fclose(f);
-    if (n == 0) return true;  // empty file counts as text
-    for (size_t i = 0; i < n; ++i) {
+    if (n == 0) return true;
+    for (size_t i = 0; i < n; ++i)
         if (buf[i] == '\0') return false;
-        // also reject files with lots of high bytes that look binary
-        // (but allow common encodings – only check for NUL)
-    }
     return true;
 }
 
@@ -507,64 +509,55 @@ static void output_default(const std::string& name, const FileInfo& info,
 // Truncate long names with ellipsis in the middle
 static std::string ellipsize(const std::string& s, int max_w) {
     if ((int)s.size() <= max_w) return s;
-    if (max_w < 5) return s.substr(0, max_w);
+    if (max_w < MIN_ELLIPSIS_WIDTH) return s.substr(0, max_w);
     int head = (max_w - 3) / 2;
     int tail = max_w - 3 - head;
     return s.substr(0, head) + "..." + s.substr((int)s.size() - tail);
 }
 
-// Print one aligned line (streaming)
+struct AlignWidths {
+    int nw = 0, cnt_w = 0, sz_w = 0, dep_w = 0, max_name_w = 0;
+};
+
 static void print_aligned_line(const std::string& name, std::uint64_t count,
                                std::uint64_t total_size, int max_depth,
-                               const Config& cfg,
-                               int nw, int cnt_w, int sz_w, int dep_w,
-                               int max_name_w,
-                               bool is_total = false,
-                               std::uint64_t grand_count = 0,
-                               std::uint64_t grand_size = 0,
-                               int total_max_depth = 0) {
-    std::uint64_t c = is_total ? grand_count : count;
-    std::string size_s;
-    if (cfg.show_size) size_s = is_total ? fmt_size_str(grand_size)
-                                          : fmt_size_str(total_size);
-    std::string depth_s;
-    if (cfg.show_depth) depth_s = is_total ? std::to_string(total_max_depth)
-                                            : std::to_string(max_depth);
-    std::string display = ellipsize(name, max_name_w);
-    printf("%*s", cnt_w, fmt_num(c).c_str());
-    if (cfg.show_size) printf("  %*s", sz_w, size_s.c_str());
-    if (cfg.show_depth) printf("  %*s", dep_w, depth_s.c_str());
-    printf("  %-*s\n", max_name_w, display.c_str());
+                               const Config& cfg, const AlignWidths& aw) {
+    std::string display = ellipsize(name, aw.max_name_w);
+    printf("%*s", aw.cnt_w, fmt_num(count).c_str());
+    if (cfg.show_size) printf("  %*s", aw.sz_w, fmt_size_str(total_size).c_str());
+    if (cfg.show_depth) printf("  %*s", aw.dep_w, std::to_string(max_depth).c_str());
+    printf("  %-*s\n", aw.max_name_w, display.c_str());
 }
 
-// Streaming aligned output: pre-compute widths from paths, then print as we go
-static void init_aligned_params(const std::vector<std::string>& paths,
-                                const Config& cfg,
-                                int& nw, int& cnt_w, int& sz_w, int& dep_w,
-                                int& max_name_w) {
-    // Pre-compute name width from paths
-    nw = 5;
+static AlignWidths init_aligned_params(const std::vector<std::string>& paths,
+                                       const Config& cfg) {
+    static constexpr int DEFAULT_COUNT_WIDTH = 12;
+    static constexpr int DEFAULT_SIZE_WIDTH  = 10;
+    static constexpr int DEFAULT_DEPTH_WIDTH = 5;
+    static constexpr int DEFAULT_TERM_WIDTH  = 80;
+
+    AlignWidths aw;
+    aw.cnt_w = DEFAULT_COUNT_WIDTH;
+    aw.sz_w  = DEFAULT_SIZE_WIDTH;
+    aw.dep_w = DEFAULT_DEPTH_WIDTH;
+
+    aw.nw = 5;
     for (auto& p : paths) {
         std::string base = basename(p);
         if (base.empty()) base = p;
-        nw = std::max(nw, (int)base.size());
+        aw.nw = std::max(aw.nw, (int)base.size());
     }
-    // Use generous fixed widths for counts/sizes (since we can't know beforehand)
-    cnt_w = 12;  // "9,999,999,999" = 12
-    sz_w = 10;   // "999,999.9 TB" ≈ 10
-    dep_w = 5;   // "65535" = 5
 
-    // Terminal width
-    int term_w = 80;
+    int term_w = DEFAULT_TERM_WIDTH;
     const char* env = getenv("COLUMNS");
     if (env) term_w = atoi(env);
-    if (term_w <= 0) term_w = 80;
+    if (term_w <= 0) term_w = DEFAULT_TERM_WIDTH;
 
-    int min_w = cnt_w + 2 + (cfg.show_size ? sz_w + 2 : 0)
-                       + (cfg.show_depth ? dep_w + 2 : 0);
-    max_name_w = std::max(term_w - min_w, 10);
-    // If name column would exceed actual longest name, cap it
-    if (nw < max_name_w) max_name_w = nw;
+    int min_w = aw.cnt_w + 2 + (cfg.show_size ? aw.sz_w + 2 : 0)
+                           + (cfg.show_depth ? aw.dep_w + 2 : 0);
+    aw.max_name_w = std::max(term_w - min_w, 10);
+    if (aw.nw < aw.max_name_w) aw.max_name_w = aw.nw;
+    return aw;
 }
 
 // ---------------------------------------------------------------------------
@@ -738,12 +731,12 @@ int main(int argc, char* argv[]) {
         else if (arg == "-F" || arg == "--find")          cfg.find_mode = true;
         else if (arg == "--unit") {
             std::string v = next();
-            if (v == "auto" || v == "AUTO") cfg.find_unit = 0;
-            else if (v == "B" || v == "b") cfg.find_unit = 1;
-            else if (v == "K" || v == "k" || v == "KB" || v == "kb") cfg.find_unit = 2;
-            else if (v == "M" || v == "m" || v == "MB" || v == "mb") cfg.find_unit = 3;
-            else if (v == "G" || v == "g" || v == "GB" || v == "gb") cfg.find_unit = 4;
-            else if (v == "T" || v == "t" || v == "TB" || v == "tb") cfg.find_unit = 5;
+            if (v == "auto" || v == "AUTO") cfg.find_unit = SizeUnit::Auto;
+            else if (v == "B" || v == "b") cfg.find_unit = SizeUnit::B;
+            else if (v == "K" || v == "k" || v == "KB" || v == "kb") cfg.find_unit = SizeUnit::KB;
+            else if (v == "M" || v == "m" || v == "MB" || v == "mb") cfg.find_unit = SizeUnit::MB;
+            else if (v == "G" || v == "g" || v == "GB" || v == "gb") cfg.find_unit = SizeUnit::GB;
+            else if (v == "T" || v == "t" || v == "TB" || v == "tb") cfg.find_unit = SizeUnit::TB;
             else { fprintf(stderr, "fscan: unknown unit '%s' (use B/KB/MB/GB/TB or auto)\n", v.c_str()); return 1; }
         }
         else if (arg == "-T" || arg == "--text")          cfg.text_only = true;
@@ -789,19 +782,18 @@ int main(int argc, char* argv[]) {
     // Set find mode column width based on unit
     if (cfg.find_mode) {
         switch (cfg.find_unit) {
-            case 1:  cfg.find_unit_w = 22; break;  // B: "14448391 B"
-            case 2:  cfg.find_unit_w = 18; break;  // KB
-            case 3:  cfg.find_unit_w = 15; break;  // MB
-            case 4:  cfg.find_unit_w = 12; break;  // GB
-            case 5:  cfg.find_unit_w = 10; break;  // TB
-            default: cfg.find_unit_w = 15; break;  // auto
+            case SizeUnit::B:  cfg.find_unit_w = 22; break;
+            case SizeUnit::KB: cfg.find_unit_w = 18; break;
+            case SizeUnit::MB: cfg.find_unit_w = 15; break;
+            case SizeUnit::GB: cfg.find_unit_w = 12; break;
+            case SizeUnit::TB: cfg.find_unit_w = 10; break;
+            default:           cfg.find_unit_w = 15; break;
         }
     }
 
-    // Pre-compute aligned column widths (only needs path names, not counts)
-    int anw = 0, acnt_w = 0, asz_w = 0, adep_w = 0, aname_w = 0;
+    AlignWidths aw;
     if (cfg.align_output)
-        init_aligned_params(cfg.paths, cfg, anw, acnt_w, asz_w, adep_w, aname_w);
+        aw = init_aligned_params(cfg.paths, cfg);
 
     std::uint64_t grand = 0;
     std::uint64_t grand_size = 0;
@@ -846,7 +838,7 @@ int main(int argc, char* argv[]) {
             fflush(stdout);
         } else if (cfg.align_output) {
             print_aligned_line(base, info.count, info.total_size, info.max_depth,
-                               cfg, anw, acnt_w, asz_w, adep_w, aname_w);
+                               cfg, aw);
             if (cfg.show_extensions && !info.ext_cnt.empty())
                 print_extensions(info);
             fflush(stdout);
@@ -862,9 +854,8 @@ int main(int argc, char* argv[]) {
             if (cfg.show_size) printf(",%lu", (unsigned long)grand_size);
             printf("\n");
         } else if (cfg.align_output) {
-            print_aligned_line("total", 0, 0, 0,
-                               cfg, anw, acnt_w, asz_w, adep_w, aname_w,
-                               true, grand, grand_size, total_max_depth);
+            print_aligned_line("total", grand, grand_size, total_max_depth,
+                               cfg, aw);
         } else {
             FileInfo total;
             total.count = grand;
